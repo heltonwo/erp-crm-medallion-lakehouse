@@ -1,0 +1,366 @@
+# Silver Layer — Documentation
+
+Detailed script-by-script documentation: what each notebook does, what problems were
+found in the data, what decisions were made, and why.
+
+---
+
+## `02_01_silver_customers`
+
+**Source:** `acdproj.bronze.crm_cust_info`
+**Target:** `acdproj.silver.crm_customers`
+
+### What this script does
+Cleans and standardizes the CRM customer master table — the primary source of
+customer identity in the project.
+
+### Problems found in the raw data
+1. **Whitespace inconsistency** — string columns had inconsistent leading/trailing
+   spaces (typical of CSV exports).
+2. **Non-standard categorical codes** — `cst_marital_status` and `cst_gndr` only
+   contained raw single-letter codes (`S`/`M` and `M`/`F`), including some nulls.
+3. **Invalid/junk records** — 4 rows had `customer_key` values that didn't follow the
+   expected `AW` + 8-digit format (`SF566`, `PO25`, `13451235`, `A01Aas`), and all had
+   null `firstname`/`lastname`. These were identified only later, while building the
+   gold layer's `dim_customers` (surrogate keys revealed rows with no name data), then
+   traced back and fixed here at the source.
+
+### Decisions made
+- **Trim generically:** looped over every `StringType` column instead of hardcoding
+  column names — a pattern reused in every subsequent script.
+- **Normalize marital status and gender** into full words (`Single`/`Married`,
+  `Male`/`Female`), with `"n/a"` as the explicit fallback for null or unexpected
+  values — chosen over leaving raw nulls so downstream consumers (BI tools, reports)
+  see an intentional label instead of a blank.
+- **Rename columns** early using a `RENAME_MAP` dict + loop, applied as one of the
+  last steps here (this was the first script; later scripts moved renaming earlier
+  for readability, once that pattern proved useful).
+- **Duplicate/invalid handling:** no duplicate *rows* were found in this table. The
+  data quality issue found was different — invalid *key format*, not duplication.
+  Resolved with a regex filter: `customer_key.rlike("^AW\\d{8}$")`, removing the 4
+  junk rows before writing to silver. This was applied retroactively after being
+  discovered during gold-layer development, then the table was reloaded fresh and
+  rewritten — a reminder that gold-layer validation can and should feed back into
+  silver-layer fixes.
+- **No date validation needed here** — this table has no start/end date fields
+  (those appear in the product table, see `02_02_silver_product` below).
+
+### Final write
+```python
+df.write.mode("overwrite").saveAsTable("acdproj.silver.crm_customers")
+```
+
+---
+
+## `02_02_silver_product`
+
+**Source:** `acdproj.bronze.crm_prd_info`
+**Target:** `acdproj.silver.crm_products`
+
+### What this script does
+Cleans the CRM product master table, splits the encoded product key into its
+component parts, and normalizes categorical/numeric fields.
+
+### Problems found in the raw data
+1. **Whitespace inconsistency** — same generic issue as the customer table.
+2. **Encoded product key** — `product_key` (e.g. `AC-HE-HL-U509-B`) packs a category
+   prefix (first 5 characters, e.g. `AC-HE`) and a product-specific suffix into one
+   string. Needed splitting to support a future join with the ERP category table.
+3. **Raw `product_line` codes** — single letters (`S`, `M`, `R`, `T`) with no
+   business meaning on their own.
+4. **Null `product_cost`** — 2 records had no cost value.
+5. **Duplicate `product_key` values — by design (SCD Type 2 history):** unlike the
+   customer table, duplication here is *not* a data quality bug. The same
+   `product_key` legitimately appears multiple times, once per historical price
+   change, each with its own `product_start_date` / `product_end_date` marking
+   when that version was valid. This is a textbook Slowly Changing Dimension
+   Type 2 pattern baked into the source data — the table's job is to preserve
+   history, not to be deduplicated in the usual sense.
+6. **A stale-state bug (process bug, not a data bug):** while normalizing
+   `product_line`, an earlier run of the notebook (with cells executed out of
+   order) caused `dfprod` to hold an already-transformed value, making every row
+   appear to map to `"n/a"`. Diagnosed by checking string length, traced to notebook
+   state, and fixed by restructuring the notebook into one strict top-to-bottom
+   sequence starting from a fresh `spark.table(...)` load — a pattern applied to
+   every script from this point on.
+
+### Decisions made
+- **Category extraction:** `substring(product_key, 1, 5)` → `category_id`;
+  `substring(product_key, 7, 100)` → `product_key_short`. Verified the 5-character
+  prefix pattern held across all distinct values before applying it (one edge case,
+  `CL-CA-CA-1098`, has a slightly different overall shape but the first-5-characters
+  rule still held).
+- **`product_line` normalization:** `S/M/R/T` → `Sales/Mountain/Road/Touring`,
+  else → `"n/a"`.
+- **Null `product_cost` handling:** `coalesce(product_cost, 0)` — chosen over
+  dropping the 2 rows, since a $0 cost is a safer default for downstream
+  sum/average calculations than losing real sales history tied to those products.
+- **Duplicate/SCD handling — the key architectural decision of this script:**
+  rather than implement a full SCD Type 2 join (matching each sale to the product
+  version that was valid on the sale's date, via a date-range join), the project
+  **keeps only the current version of each product** for the *dimension* table,
+  filtering `product_end_date IS NULL`. This is a deliberate simplification:
+  - **Pro:** much simpler to build and reason about; appropriate for a portfolio
+    project at this stage.
+  - **Con:** the dimension only reflects each product's *current* attributes
+    (price, etc.), not what was true at the time of a historical sale — a
+    limitation worth stating explicitly rather than hiding.
+  - **Downstream consequence:** this decision is *why* `fact_sales` later needed a
+    fallback (`product_sk = -1`) for sales referencing product keys where every
+    historical version had already ended — i.e., genuinely discontinued products
+    with zero surviving "current" version. See `03_02_gold_products_dim` and
+    `03_03_gold_sales_fact` in the gold layer documentation.
+- **`product_start_date` / `product_end_date` validation:** no explicit date-range
+  validation logic was added in this script (e.g. checking that `start_date <
+  end_date`, or that a product's date ranges don't overlap). The dates were kept
+  as-is from the source and used only as a filter condition (`IS NULL` = current).
+  This is a known gap: a more rigorous pipeline would validate that each
+  product's SCD history has no overlapping or malformed date ranges before trusting
+  the "current version" filter.
+
+### Final write
+```python
+dfprod.write.mode("overwrite").saveAsTable("acdproj.silver.crm_products")
+```
+
+---
+
+## `02_03_silver_sales`
+
+**Source:** `acdproj.bronze.crm_sales_details`
+**Target:** `acdproj.silver.crm_sales`
+
+### What this script does
+Cleans the sales transaction table: fixes broken numeric fields, converts
+malformed date integers into real dates, and validates the core business rule
+that ties quantity, price, and total sale value together.
+
+### Problems found in the raw data
+1. **Whitespace inconsistency** — same generic issue as the other CRM tables.
+2. **Price / sales_amount inconsistencies (35 rows out of ~60k)** — three distinct
+   failure patterns, all caught by one combined filter checking
+   `sales_amount != quantity * price` OR either field being null/invalid:
+   - Null `price` with valid `sales_amount` and `quantity`.
+   - **Negative** `price` (e.g. `-769`) — a clear data-entry sign error, not a
+     genuinely negative price.
+   - `sales_amount` not matching `quantity * price` at all.
+3. **Dates stored as integers in `YYYYMMDD` format**, with `0` used as a sentinel
+   value for "no date" in the source system.
+4. **A malformed date value** — one `order_date` was `32154`, a 5-digit number that
+   is neither `0` nor a valid 8-digit date. This broke the initial `to_date()` call
+   entirely (the whole job failed), not just that one row.
+
+### Decisions made
+- **Fixing price before sales_amount, in that specific order:** first recalculate
+  `price = abs(sales_amount) / quantity` wherever price was null or `<= 0` (using
+  `abs()` to correct the sign-error rows). *Then*, recalculate
+  `sales_amount = quantity * price` wherever it didn't match — using the
+  already-corrected price. Doing this in the reverse order would have propagated
+  the bad price values instead of fixing them.
+- **Date cleaning in two steps:** first replace `0` with `null` (so it doesn't get
+  misinterpreted as a real date), then parse the remaining values.
+- **`to_date` → `try_to_date`:** switched after the `32154` value crashed the whole
+  transformation with `CANNOT_PARSE_TIMESTAMP`. `try_to_date` returns `null` for
+  any value that doesn't match the expected format, instead of failing the entire
+  job — a fault-tolerant parsing choice appropriate for messy source data.
+- **Validation step before writing:** re-ran the exact same inconsistency filter
+  that originally found the 35 bad rows, plus a null-date count, immediately before
+  the write — confirming both had dropped to expected levels (0 inconsistencies;
+  19 null dates, now including both the original `0`s and the newly-nulled
+  malformed value).
+- **Duplicate handling:** no duplicate order lines were found or treated in this
+  table — each row represents one order line item (`order_number` +
+  `product_key` combination), and no evidence of true duplication surfaced during
+  inspection. The data quality issues here were about *value correctness*
+  (price/amount math, date format), not row duplication.
+- **No product/customer key format issues handled here** — those were discovered
+  and fixed later, at the point of joining this table into `fact_sales` in the gold
+  layer (see gold layer documentation): `customer_id` needed reformatting to match
+  `crm_customers.customer_key`, and `product_key` here actually corresponds to
+  `product_key_short` from the product table, not the full `product_key`.
+
+### Final write
+```python
+dfsales.write.mode("overwrite").saveAsTable("acdproj.silver.crm_sales")
+```
+
+---
+
+## `02_04_silver_customers_erp`
+
+**Source:** `acdproj.bronze.erp_cust_az12`
+**Target:** `acdproj.silver.erp_customers`
+
+### What this script does
+Cleans the ERP customer table (a secondary source of customer attributes —
+birth date and gender — that complements the CRM customer table).
+
+### Problems found in the raw data
+1. **`CID` prefix mismatch** — the ERP customer identifier came as
+   `NASAW00011000...` (13 characters), while the CRM's `customer_key` is
+   `AW00011000` (10 characters). Same underlying customer, incompatible key format.
+   Confirmed the `"NAS"` prefix was consistent (length 13, prefix `"NAS"`) across
+   the whole column before removing it.
+2. **Misleading column name caught before running:** an early draft mapped `BDATE`
+   to `create_date`, which is semantically wrong — `BDATE` is birth date, not a
+   record-creation timestamp. Caught and corrected to `birth_date` before writing
+   any code.
+3. **Gender field inconsistency, found in two stages:**
+   - First pass: nulls only appeared to be the issue.
+   - Scrolling further into the full dataset (not just the first sample) revealed
+     the real picture: `GEN` mixed abbreviated (`M`/`F`), full (`Male`/`Female`),
+     and null values — a good example of why a small preview sample isn't enough
+     to trust a column is clean.
+
+### Decisions made
+- **Renamed columns first, before any other transformation** — a change from the
+  earlier scripts, adopted from this point onward because it made every
+  subsequent line of code easier to read (`customer_id` instead of `CID`, etc.).
+- **`customer_id` cleanup:** `substring(customer_id, 4, 100)` to drop the 3-character
+  `"NAS"` prefix, aligning the format with `crm_customers.customer_key`.
+- **Gender normalization covering both formats in one pass:**
+  ```python
+  F.when(F.upper(col).isin("M", "MALE"), "Male")
+   .when(F.upper(col).isin("F", "FEMALE"), "Female")
+   .otherwise("n/a")
+  ```
+  Using `.isin(...)` instead of one `.when()` per raw value kept the mapping compact.
+- **Duplicate handling:** no duplicate rows were found in this table. The data
+  quality issues were about key *format* (the `NAS` prefix) and *value*
+  inconsistency (gender), not row duplication.
+- **No date validation applicable** — `birth_date` is a single point-in-time
+  attribute per customer, not a start/end validity range, so no SCD-style
+  validation was relevant here.
+
+### Final write
+```python
+df_erpc.write.mode("overwrite").saveAsTable("acdproj.silver.erp_customers")
+```
+
+
+---
+
+## `02_05_silver_locations`
+
+**Source:** `acdproj.bronze.erp_loc_a101`
+**Target:** `acdproj.silver.erp_locations`
+
+### What this script does
+Cleans the ERP location table, which supplies each customer's country.
+
+### Problems found in the raw data
+1. **Country name inconsistency** — a `distinct()` audit of the `CNTRY` column
+   revealed the same country represented multiple ways: `US` / `USA` /
+   `United States`, and `DE` / `Germany`, plus some null values.
+2. **`CID` hyphen mismatch** — this table's customer identifier came as
+   `AW-00020900` (11 characters, with a hyphen), again incompatible with the CRM's
+   clean `AW00020900` format. Confirmed length was consistently 11 across the
+   column before fixing it.
+
+### Decisions made
+- **Country normalization via `when/otherwise`:** `.isin("US", "USA")` →
+  `"United States"`; `"DE"` → `"Germany"`; null or empty string → `"n/a"`; anything
+  else passed through unchanged via `.otherwise(trim(col))`.
+- **`regexp_replace` instead of `substring` for the CID fix:** unlike the ERP
+  customer table (where the unwanted prefix was at a fixed position, handled with
+  `substring`), here the hyphen sits in the *middle* of the string. `regexp_replace`
+  was the better tool because it removes a pattern wherever it appears, without
+  needing to calculate an exact character position — the deciding factor between
+  these two techniques throughout the whole project was always *where* the
+  unwanted characters are located.
+- **Duplicate handling:** no duplicate rows found. As with the other ERP tables,
+  the issues were about value standardization (country naming) and key format
+  (hyphen), not duplication.
+- **No date fields in this table** — no date validation applicable.
+
+### Final write
+```python
+df_erploc.write.mode("overwrite").saveAsTable("acdproj.silver.erp_locations")
+```
+
+---
+
+## `02_06_silver_categories`
+
+**Source:** `acdproj.bronze.erp_px_cat_g1v2`
+**Target:** `acdproj.silver.erp_categories`
+
+### What this script does
+Cleans the ERP product category table, which supplies the human-readable
+category/subcategory names that pair with the `category_id` extracted from
+`crm_products.product_key`.
+
+### Problems found in the raw data
+This was, by a clear margin, **the cleanest source table in the entire project**:
+- **Zero nulls** across every column, confirmed with a per-column null-count audit
+  (a list comprehension building one `count(when(isNull, ...))` expression per
+  column, checked in a single query instead of one filter per column).
+- **`MAINTENANCE` already consistent** — only `Yes`/`No`, no `Y`/`N` or lowercase
+  variants, confirmed with a `distinct()` check.
+- No key-format mismatch to fix: `category_id` values (`AC_BR`, `BI_MB`, etc.)
+  matched the format expected for the join with `crm_products.category_id`, once
+  the hyphen-vs-underscore mismatch on the CRM side was fixed (see the gold layer
+  documentation for `03_02_gold_products_dim`).
+
+### Decisions made
+- **Minimal transformation, by design — not by oversight:** only `trim()` (applied
+  as a general precaution/consistency habit across every script, not because a
+  whitespace problem was actually found here) and column renaming
+  (`ID`→`category_id`, `CAT`→`category`, `SUBCAT`→`subcategory`,
+  `MAINTENANCE`→`maintenance`). No normalization, no null handling, no key
+  reformatting was needed.
+- **`category_id` naming chosen deliberately to match `crm_products`:** renaming
+  `ID` to `category_id` here (rather than something more generic) was intentional,
+  so the join key name lines up exactly with the `category_id` already present in
+  `crm_products` — no extra renaming needed later at join time.
+- **Duplicate handling:** no duplicates found — not applicable to discuss further
+  given how clean the source already was.
+- **No date fields in this table** — no date validation applicable.
+
+### Final write
+```python
+df_erpcat.write.mode("overwrite").saveAsTable("acdproj.silver.erp_categories")
+```
+
+---
+
+## Summary — Duplicate Handling Across the Silver Layer
+
+| Script | Duplicates found? | How handled |
+|---|---|---|
+| `crm_customers` | No row duplication. 4 rows had invalid key *format* (junk/test data). | Regex filter `^AW\d{8}$` removed the 4 invalid rows. |
+| `crm_products` | **Yes — by design.** Same `product_key` appears once per historical price version (SCD Type 2). | Not deduplicated in the usual sense — filtered to keep only the current version (`product_end_date IS NULL`) for the dimension table. |
+| `crm_sales` | No duplication found. | N/A — issues were value-correctness (price/amount math), not duplicate rows. |
+| `erp_customers` | No duplication found. | N/A — issue was key format (`NAS` prefix), not duplication. |
+| `erp_locations` | No duplication found. | N/A — issues were value standardization (country names) and key format (hyphen). |
+| `erp_categories` | No duplication found. | N/A — cleanest table in the project. |
+
+**Key takeaway:** across six source tables, genuine row-level duplication only
+appeared once, and it wasn't a data quality bug at all — it was the intended
+behavior of an SCD Type 2 source table. Every other "duplicate-looking" issue in
+the project was actually a *key format* mismatch between systems (CRM vs ERP),
+which is a different problem requiring a different fix (string manipulation, not
+deduplication logic).
+
+## Summary — `product_start_date` / `product_end_date` Validation
+
+The only table with a start/end date pair is `crm_products`. The validation
+applied was **narrow and specific to this project's needs**, not a general SCD
+integrity check:
+
+- **What was checked:** whether `product_end_date IS NULL`, used purely as a
+  filter to select each product's current version for the dimension table.
+- **What was NOT checked (known gap, stated explicitly rather than hidden):**
+  - Whether `product_start_date < product_end_date` for every historical row.
+  - Whether a given `product_key`'s date ranges overlap (e.g. two "current"
+    versions active at once, which would break the `IS NULL` filter's assumption
+    that there's exactly one current row per product).
+  - Whether there are gaps in history (a product with no version covering some
+    date range).
+- **Why this was an acceptable trade-off here:** the project's scope is a
+  portfolio-level analytics build, not a production SCD pipeline. The `IS NULL`
+  filter was verified empirically to produce a sensible row count (197 current
+  products from 397 total historical rows) and the resulting dimension was cross-
+  checked against `fact_sales` for referential integrity (see gold layer docs) —
+  which surfaced the discontinued-product gap and led to the `product_sk = -1`
+  placeholder fix, rather than a formal date-range audit catching it beforehand.
