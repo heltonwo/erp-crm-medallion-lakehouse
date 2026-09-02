@@ -1,4 +1,5 @@
-# erp-crm-medallion-lakehouse
+# ERP CRM Medallion Lakehouse
+
 
 A Databricks Lakehouse project implementing the **Medallion Architecture**
 (Bronze → Silver → Gold) to integrate CRM and ERP data into a unified,
@@ -162,4 +163,8 @@ mirror a multi-system integration scenario.
 
 ## Author
 
-**Helton Santos** — [github.com/heltonwo](https://github.com/heltonwo)
+**Helton Santos**
+
+**Linkedin** — [linkedin.com/in/helton-santos](https://www.linkedin.com/in/helton-santos-754a69206)
+
+**Git** — [github.com/heltonwo](https://github.com/heltonwo)
